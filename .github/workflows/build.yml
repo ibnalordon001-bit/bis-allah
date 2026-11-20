@@ -1,0 +1,193 @@
+
+name: Build and Sign FocusLock APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      # 1. Extract the uploaded source ZIP
+      - name: Extract FocusLock source
+        shell: bash
+        run: |
+          set -e
+
+          ZIP_FILE=$(find . -type f \
+            -name 'FocusLock-patched-source(1).zip' \
+            | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: Source ZIP not found"
+            find . -maxdepth 3 -type f
+            exit 1
+          fi
+
+          echo "Found source: $ZIP_FILE"
+
+          mkdir -p "$RUNNER_TEMP/focuslock-source"
+          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/focuslock-source"
+
+          echo "Source extracted successfully"
+
+      # 2. Locate Gradle project and keystore
+      - name: Detect project and signing key
+        shell: bash
+        run: |
+          set -e
+
+          SETTINGS=$(find "$RUNNER_TEMP/focuslock-source" \
+            -type f \( \
+              -name settings.gradle.kts -o \
+              -name settings.gradle \
+            \) | head -n 1)
+
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: Gradle settings file not found"
+            find "$RUNNER_TEMP/focuslock-source" -maxdepth 5 -type f
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS")
+          KEYSTORE="$PROJECT_DIR/app/focuslock.keystore"
+
+          if [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ] && \
+             [ ! -f "$PROJECT_DIR/app/build.gradle" ]; then
+            echo "ERROR: App Gradle file not found"
+            exit 1
+          fi
+
+          if [ ! -f "$KEYSTORE" ]; then
+            echo "ERROR: Keystore not found: $KEYSTORE"
+            find "$PROJECT_DIR" -name "*.keystore" -o -name "*.jks"
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "KEYSTORE=$KEYSTORE" >> "$GITHUB_ENV"
+
+          echo "Project: $PROJECT_DIR"
+          echo "Keystore: $KEYSTORE"
+
+      # 3. Verify signing credentials
+      - name: Verify signing key
+        shell: bash
+        run: |
+          set -e
+
+          keytool -list -v \
+            -keystore "$KEYSTORE" \
+            -alias focuslock \
+            -storepass focuslock123 \
+            -keypass focuslock123
+
+      # 4. Build APK
+      - name: Build APK
+        shell: bash
+        run: |
+          set -e
+
+          gradle -p "$PROJECT_DIR" \
+            :app:assembleDebug \
+            --no-daemon
+
+      # 5. Locate and align APK
+      - name: Align APK
+        shell: bash
+        run: |
+          set -e
+
+          APK=$(find "$PROJECT_DIR/app/build/outputs/apk" \
+            -type f -name "*.apk" | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK was not generated"
+            exit 1
+          fi
+
+          ZIPALIGN=$(find "$ANDROID_HOME/build-tools" \
+            -type f -name zipalign | sort -V | tail -n 1)
+
+          if [ -z "$ZIPALIGN" ]; then
+            echo "ERROR: zipalign not found"
+            exit 1
+          fi
+
+          "$ZIPALIGN" -f -p 4 \
+            "$APK" \
+            "$RUNNER_TEMP/FocusLock-aligned.apk"
+
+      # 6. Sign APK with project keystore
+      - name: Sign APK
+        shell: bash
+        run: |
+          set -e
+
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" \
+            -type f -name apksigner | sort -V | tail -n 1)
+
+          "$APKSIGNER" sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias focuslock \
+            --ks-pass pass:focuslock123 \
+            --key-pass pass:focuslock123 \
+            --out "$RUNNER_TEMP/FocusLock-signed.apk" \
+            "$RUNNER_TEMP/FocusLock-aligned.apk"
+
+      # 7. Verify final signature
+      - name: Verify APK signature
+        shell: bash
+        run: |
+          set -e
+
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" \
+            -type f -name apksigner | sort -V | tail -n 1)
+
+          "$APKSIGNER" verify --verbose --print-certs \
+            "$RUNNER_TEMP/FocusLock-signed.apk"
+
+          CERT=$("$APKSIGNER" verify --print-certs \
+            "$RUNNER_TEMP/FocusLock-signed.apk" \
+            | sed -n 's/.*SHA-256 digest: //p' \
+            | head -n 1 \
+            | tr -d ':[:space:]' \
+            | tr '[:lower:]' '[:upper:]')
+
+          EXPECTED="D98951C01EEF058E9B65625050F0900D351F86A9BD9059F58CC791638305CB0A"
+
+          if [ "$CERT" != "$EXPECTED" ]; then
+            echo "ERROR: APK signing certificate mismatch"
+            echo "Expected: $EXPECTED"
+            echo "Actual: $CERT"
+            exit 1
+          fi
+
+          echo "Signature verified successfully"
+
+      # 8. Upload final APK
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FocusLock-signed-APK
+          path: ${{ runner.temp }}/FocusLock-signed.apk
+          if-no-files-found: error
+          
